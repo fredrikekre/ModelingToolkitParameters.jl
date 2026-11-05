@@ -31,7 +31,7 @@ SymbolicIndexingInterface = "0.3.46"
 Symbolics = "6,7"
 TOML = "1.0.3"
 WGLMakie = "0.10, 0.11, 0.12, 0.13"
-julia = "1"
+julia = "1.11"
 
 [extras]
 StructEditor = "f41bf64d-372c-4047-8f65-4cd74346a5da"
