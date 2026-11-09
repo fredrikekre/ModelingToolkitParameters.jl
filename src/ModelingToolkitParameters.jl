@@ -3,7 +3,7 @@ using ModelingToolkit
 using SymbolicIndexingInterface
 using Symbolics
 using SciMLBase
-using InteractiveUtils: clipboard
+using InteractiveUtils: clipboard, subtypes
 using TOML
 using AbstractTrees
 using Logging
@@ -673,7 +673,9 @@ entries (recursively walking sub-systems). This is the form accepted by
 Fields of `pars` that don't have a matching property on `model` produce a warning
 and are skipped.
 """
-function Base.Pair(model::System, pars::MTKParams)
+Base.Pair(model::System, pars::MTKParams) = pairs_against(model, pars, model)
+
+function pairs_against(model::System, pars::MTKParams, root::System)
 
   #TODO: confirm that model and pars are properly paired
 
@@ -683,12 +685,11 @@ function Base.Pair(model::System, pars::MTKParams)
     if hasproperty(model, nm)
       sym = getproperty(model,nm)
       val = getproperty(pars,nm)
-      x = ModelingToolkit.unwrap(sym) => val
-      if x isa Vector
-        append!(prs, x)
+      if sym isa System
+        append!(prs, pairs_against(sym, val, root))
       else
         # if !ismissing(val) & !isnothing(val)
-        push!(prs, x)
+        push!(prs, system_symbol(root, sym) => system_value(root, val))
         # end
       end
     else
@@ -697,6 +698,38 @@ function Base.Pair(model::System, pars::MTKParams)
   end
 
   return prs
+end
+
+"""
+    system_symbol(root::System, sym)
+
+The parameter of `root` that `sym` (from `getproperty` on `root` or one of its subsystems)
+stands for. Usually `sym` itself; but after `ModelingToolkit.respecialize`, which narrows a
+struct-typed parameter to the concrete type of its value, `getproperty` still returns the old
+abstract-typed symbol, which is no longer a parameter of `root` (a setter built from it fails,
+and a symbolic `remake` with it warns and changes nothing). Such a symbol is looked up by name.
+"""
+function system_symbol(root::System, sym)
+  s = ModelingToolkit.unwrap(sym)
+  ModelingToolkit.iscomplete(root) || return s
+  symbolic_type(s) isa ScalarSymbolic || return s
+  is_parameter(root, s) && return s
+  n = ModelingToolkit.getname(s)
+  for p in parameters(root)
+    ModelingToolkit.getname(p) == n && return ModelingToolkit.unwrap(p)
+  end
+  return s
+end
+
+# A value that is an expression of other parameters (`inductor.L => L`), with every parameter
+# in it resolved by `system_symbol`.
+function system_value(root::System, val)
+  v = ModelingToolkit.unwrap(val)
+  ModelingToolkit.iscomplete(root) || return val
+  symbolic_type(v) === NotSymbolic() && return val
+  vs = Symbolics.get_variables(v)
+  sub = Dict(x => system_symbol(root, x) for x in vs if !isequal(x, system_symbol(root, x)))
+  return isempty(sub) ? val : Symbolics.substitute(v, sub)
 end
 
 
@@ -725,7 +758,11 @@ end
 function Base.setproperty!(x::MTKParams, dict::Dict)
     for (key,value) in dict
         skey = Symbol(key)
-        if value isa Dict
+        if value isa Dict && ModelingToolkit.isparameter(getproperty(get_parent(x), skey))
+          # a struct-typed parameter, written by `save_parameters` as a table naming its type
+          sym = getproperty(get_parent(x), skey)
+          setproperty!(x, skey, decode_struct(Symbolics.symtype(Symbolics.unwrap(sym)), value))
+        elseif value isa Dict
           setproperty!(getproperty(x, skey), value)
         elseif value isa String
           setproperty!(x, skey, eval(Meta.parse(value)))
@@ -759,8 +796,81 @@ function Base.copy(x::MTKParams)
 end
 
 # fallback value conversion
-convert_value(x) = x
+convert_value(x) = isstructtype(typeof(x)) && !(x isa Symbolics.Num) ? encode_struct(x) : x
 convert_value(x::Missing) = "missing"
+
+"""
+    encode_struct(x) -> Dict{String, Any}
+
+The file form of a struct-typed parameter value: a table with the type's name under `type` and
+one entry per field (nested structs likewise), e.g. `{type = "Alloy", rho = 1.0, factor = 3.0}`.
+[`load_parameters`](@ref) reads it back with [`decode_struct`](@ref), without evaluating code.
+"""
+function encode_struct(x)
+  d = Dict{String, Any}("type" => string(nameof(typeof(x))))
+  for f in fieldnames(typeof(x))
+    d[string(f)] = convert_value(getfield(x, f))
+  end
+  return d
+end
+
+# `T` itself if concrete, and every concrete subtype of `T`, by name.
+function concrete_types(T::Type, acc = Dict{String, Type}())
+  isconcretetype(T) && (acc[string(nameof(T))] = T)
+  T isa DataType && isabstracttype(T) && foreach(S -> concrete_types(S, acc), subtypes(T))
+  return acc
+end
+
+# `subtypes` scans every loaded module (~20 ms), so the lookup is kept per declared type and
+# redone only when a name is not found (a subtype from a package loaded since).
+const CONCRETE_TYPES = IdDict{Type, Dict{String, Type}}()
+const CONCRETE_TYPES_LOCK = ReentrantLock()
+function cached_concrete_types(T::Type; refresh::Bool = false)
+  lock(CONCRETE_TYPES_LOCK) do
+    refresh ? (CONCRETE_TYPES[T] = concrete_types(T)) : get!(() -> concrete_types(T), CONCRETE_TYPES, T)
+  end
+end
+
+"""
+    decode_struct(T::Type, d::AbstractDict)
+
+Construct the value a table written by [`encode_struct`](@ref) describes, for a parameter
+declared as `::T`. The `type` entry must name `T` or one of its concrete subtypes (the only
+types considered, so a file cannot construct anything else); fields are passed positionally in
+`fieldnames` order, and a nested table is decoded against its field's declared type.
+"""
+function decode_struct(T::Type, d::AbstractDict)
+  tn = get(d, "type", nothing)
+  tn === nothing && error("a value for a parameter of type $T needs a `type` entry, got $(collect(keys(d)))")
+  S = get(cached_concrete_types(T), tn, nothing)
+  S === nothing && (S = get(cached_concrete_types(T; refresh = true), tn, nothing))
+  S === nothing && error("`$tn` is not $T or one of its concrete subtypes")
+  names = fieldnames(S)
+  extra = setdiff(keys(d), ["type"; collect(string.(names))])
+  isempty(extra) || error("`$tn` has no field(s) $(collect(extra))")
+  vals = map(enumerate(names)) do (i, f)
+    haskey(d, string(f)) || error("`$tn` needs field `$f`")
+    v = d[string(f)]
+    v isa AbstractDict ? decode_struct(fieldtype(S, i), v) : v
+  end
+  return S(vals...)
+end
+
+# What `save_parameters` writes: `Dict(x)` without values that are expressions of other
+# parameters (a parent's parameter passed down, `inductor.L = L`; they follow
+# their source and could not be read back) and without the tables that leaves empty.
+function saveable(d::AbstractDict)
+  out = Dict{Symbol, Any}()
+  for (k, v) in d
+    if v isa AbstractDict
+      c = saveable(v)
+      isempty(c) || (out[k] = c)
+    elseif !(symbolic_type(Symbolics.unwrap(v)) isa ScalarSymbolic)
+      out[k] = v
+    end
+  end
+  return out
+end
 
 """
     save_parameters(x::MTKParams, filepath::String)
@@ -771,7 +881,7 @@ as the string `"missing"` so they round-trip through [`load_parameters`](@ref).
 function save_parameters(x::MTKParams, filepath::String)
 
   open(filepath, "w") do io
-    TOML.print(convert_value, io, Dict(x))
+    TOML.print(convert_value, io, saveable(Dict(x)))
   end
 
 end
@@ -784,7 +894,7 @@ Return the TOML representation of `x` as a `String`. Same format as
 """
 function parameters_to_string(x::MTKParams)
   io = IOBuffer()
-  TOML.print(convert_value, io, Dict(x))
+  TOML.print(convert_value, io, saveable(Dict(x)))
   return String(take!(io))
 end
 
@@ -866,7 +976,7 @@ function cache(model::System, x::MTKParams; parent=model)
         ps = cache(p, getproperty(x, nm); parent)
         append!(prs, ps)
       else
-        setter = setp(parent, p)
+        setter = setp(parent, system_symbol(parent, p))
         push!(prs, setter)
       end
     end
