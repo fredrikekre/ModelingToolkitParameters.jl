@@ -47,7 +47,7 @@ end
         for bad in ("stuff = {type = \"Base.Libc\", k = 1.0}", "stuff = {type = \"Plain\"}",
                     "stuff = {type = \"Plain\", k = 1.0, z = 2.0}", "stuff = {k = 1.0}")
             write(f, bad)
-            @test_throws ErrorException load_parameters(f, Outer)
+            @test_throws Exception load_parameters(f, Outer)
         end
     end
 

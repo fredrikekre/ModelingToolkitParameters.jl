@@ -5,10 +5,11 @@ using Symbolics
 using SciMLBase
 using InteractiveUtils: clipboard, subtypes
 using TOML
+using StructUtils
 using AbstractTrees
 using Logging
 
-export MTKParams, get_parent, get_defs, parameter_pairs, pdict, cache, update!, update, transfer, compare, MTKParamsDiff, @mtkparams, save_parameters, load_parameters, show_missing!, hide_missing!
+export MTKParams, get_parent, get_defs, parameter_pairs, pdict, cache, update!, update, transfer, compare, MTKParamsDiff, @mtkparams, save_parameters, load_parameters, ParameterFileStyle, show_missing!, hide_missing!
 
 """
     MTKParamsOptions()
@@ -783,19 +784,23 @@ end
 Set the values in `dict`, nested as [`Dict`](@ref Dict(::MTKParams)) returns them (one
 dictionary per subsystem; keys may be `Symbol`s or strings, as from `TOML.parse`).
 A dictionary value for a struct-typed parameter is a table naming its type, as
-[`save_parameters`](@ref) writes it.
+[`save_parameters`](@ref) writes it, and is read with `StructUtils.make` (see
+[`ParameterFileStyle`](@ref)). The string `"missing"` stands for `missing`; any other string
+is only accepted for a `String`-typed parameter. Nothing is evaluated.
 """
 function update!(x::MTKParams, dict::AbstractDict)
     for (key,value) in dict
         skey = Symbol(key)
-        if value isa Dict && ModelingToolkit.isparameter(getproperty(get_parent(x), skey))
-          # a struct-typed parameter, written by `save_parameters` as a table naming its type
-          sym = getproperty(get_parent(x), skey)
-          setproperty!(x, skey, decode_struct(Symbolics.symtype(Symbolics.unwrap(sym)), value))
-        elseif value isa Dict
+        sym = getproperty(get_parent(x), skey)
+        if value isa AbstractDict && ModelingToolkit.isparameter(sym)
+          T = Symbolics.symtype(Symbolics.unwrap(sym))
+          setproperty!(x, skey, from_file(T, value))
+        elseif value isa AbstractDict
           update!(getproperty(x, skey), value)
-        elseif value isa String
-          setproperty!(x, skey, eval(Meta.parse(value)))
+        elseif value == "missing"
+          setproperty!(x, skey, missing)
+        elseif value isa AbstractString && !(ModelingToolkit.isparameter(sym) && String <: Symbolics.symtype(Symbolics.unwrap(sym)))
+          error("`$skey`: a string value is only accepted for a `String` parameter or as \"missing\", got \"$value\"")
         else
           setproperty!(x, skey, value)
         end
@@ -807,23 +812,68 @@ function Base.copy(x::MTKParams)
     return MTKParams(get_parent(x), copy(get_defs(x)), copy(get_bound(x)), copy(get_unresolved(x)), copy(get_options(x)))
 end
 
-# fallback value conversion
-convert_value(x) = isstructtype(typeof(x)) && !(x isa Symbolics.Num) ? encode_struct(x) : x
-convert_value(x::Missing) = "missing"
+# Parameter files ----------------------------------------------------------------------------
 
 """
-    encode_struct(x) -> Dict{String, Any}
+    ParameterFileStyle()
 
-The file form of a struct-typed parameter value: a table with the type's name under `type` and
-one entry per field (nested structs likewise), e.g. `{type = "Alloy", rho = 1.0, factor = 3.0}`.
-[`load_parameters`](@ref) reads it back with [`decode_struct`](@ref), without evaluating code.
+The `StructUtils.StructStyle` with which [`save_parameters`](@ref) writes struct-typed
+parameter values and [`load_parameters`](@ref) reads them back. A struct is a table naming its
+type, plus one entry per field: `stuff = {type = "Alloy", rho = 1.0, factor = 3.0}`. On load,
+`StructUtils.make` builds it against the parameter's declared type. Nothing in a file is
+evaluated, and `type` must name the declared type or one of its concrete subtypes.
+
+The package that defines a parameter type can shape its file form with StructUtils alone:
+- field tags under the `params` key: `rho::Float64 &(params = (name = "density",),)` renames
+  the entry, `&(params = (ignore = true,),)` leaves the field out of files;
+- `@kwarg` or `@defaults`, so that a file may leave a field out.
+
+and, with methods for this style:
+- `StructUtils.lower(::ParameterFileStyle, x::T)` returning a `Dict` to write in place of `x`'s
+  fields, with `StructUtils.structlike(::ParameterFileStyle, ::Type{T}) = false` and
+  `StructUtils.lift(::ParameterFileStyle, ::Type{T}, table) = (value, nothing)` to rebuild it.
+  This saves a value as a reference, e.g. a lookup table by name rather than its data.
+- `StructUtils.@choosetype ParameterFileStyle T table -> S` to choose the concrete type for an
+  abstract `T` other than by the `type` entry.
+
+An entry that matches no field is an error. The string `"missing"` stands for `missing`, since
+TOML has no null.
 """
-function encode_struct(x)
-  d = Dict{String, Any}("type" => string(nameof(typeof(x))))
-  for f in fieldnames(typeof(x))
-    d[string(f)] = convert_value(getfield(x, f))
+struct ParameterFileStyle <: StructUtils.StructStyle end
+const FILE_STYLE = ParameterFileStyle()
+
+StructUtils.fieldtagkey(::ParameterFileStyle) = :params
+
+# A misspelt entry would otherwise be dropped silently and the field's default used. The `type`
+# entry is checked here too, for structs built field by field.
+function StructUtils.unknownfield(::ParameterFileStyle, ::Type{T}, key, value) where {T}
+  if string(key) == "type"
+    string(value) == string(nameof(T)) || error("`type = \"$value\"` given for a value of type `$T`")
+    return nothing
   end
-  return d
+  error("`$(nameof(T))` has no field `$key`")
+end
+
+# Reached for a type that is not built field by field. A table for an abstract declared type
+# names its concrete type; everything else is lifted as StructUtils does by default.
+function StructUtils.lift(st::ParameterFileStyle, ::Type{T}, x) where {T}
+  if x isa AbstractDict && !isconcretetype(T)
+    return StructUtils.make(st, concrete_type(T, x), x)
+  end
+  return StructUtils.lift(T, x), StructUtils.defaultstate(st)
+end
+# resolves the ambiguity with StructUtils' method for 0-dimensional arrays
+StructUtils.lift(st::ParameterFileStyle, ::Type{A}, x) where {T, A <: AbstractArray{T, 0}} =
+  invoke(StructUtils.lift, Tuple{StructUtils.StructStyle, Type{A}, Any}, st, A, x)
+
+# The concrete type a table's `type` entry names: `T` or one of its concrete subtypes.
+function concrete_type(T::Type, x::AbstractDict)
+  tn = get(x, "type", nothing)
+  tn === nothing && error("a value of type `$T` needs a `type` entry naming the concrete type, got $(collect(keys(x)))")
+  S = get(cached_concrete_types(T), tn, nothing)
+  S === nothing && (S = get(cached_concrete_types(T; refresh = true), tn, nothing))
+  S === nothing && error("`$tn` is not `$T` or one of its concrete subtypes")
+  return S
 end
 
 # `T` itself if concrete, and every concrete subtype of `T`, by name.
@@ -843,42 +893,45 @@ function cached_concrete_types(T::Type; refresh::Bool = false)
   end
 end
 
-"""
-    decode_struct(T::Type, d::AbstractDict)
+# A parameter value of declared type `T` from its table in a file.
+from_file(::Type{T}, table::AbstractDict) where {T} = first(StructUtils.make(FILE_STYLE, T, unmissing(table)))
 
-Construct the value a table written by [`encode_struct`](@ref) describes, for a parameter
-declared as `::T`. The `type` entry must name `T` or one of its concrete subtypes (the only
-types considered, so a file cannot construct anything else); fields are passed positionally in
-`fieldnames` order, and a nested table is decoded against its field's declared type.
-"""
-function decode_struct(T::Type, d::AbstractDict)
-  tn = get(d, "type", nothing)
-  tn === nothing && error("a value for a parameter of type $T needs a `type` entry, got $(collect(keys(d)))")
-  S = get(cached_concrete_types(T), tn, nothing)
-  S === nothing && (S = get(cached_concrete_types(T; refresh = true), tn, nothing))
-  S === nothing && error("`$tn` is not $T or one of its concrete subtypes")
-  names = fieldnames(S)
-  extra = setdiff(keys(d), ["type"; collect(string.(names))])
-  isempty(extra) || error("`$tn` has no field(s) $(collect(extra))")
-  vals = map(enumerate(names)) do (i, f)
-    haskey(d, string(f)) || error("`$tn` needs field `$f`")
-    v = d[string(f)]
-    v isa AbstractDict ? decode_struct(fieldtype(S, i), v) : v
+unmissing(x) = x == "missing" ? missing : x
+unmissing(x::AbstractDict) = Dict{String, Any}(string(k) => unmissing(v) for (k, v) in x)
+unmissing(x::AbstractVector) = Any[unmissing(v) for v in x]
+
+# The file form of a parameter value: numbers, strings and arrays as they are, a struct as a
+# table naming its type (or what `StructUtils.lower` makes of it), `missing` as "missing".
+file_value(x) = _file_value(StructUtils.lower(FILE_STYLE, x), x)
+_file_value(::Missing, _) = "missing"
+_file_value(y::AbstractVector, _) = Any[file_value(v) for v in y]
+function _file_value(y::AbstractDict, x)
+  d = Dict{String, Any}(string(k) => file_value(v) for (k, v) in y)
+  x isa AbstractDict || haskey(d, "type") || (d["type"] = string(nameof(typeof(x))))
+  return d
+end
+function _file_value(y, _)
+  StructUtils.structlike(FILE_STYLE, typeof(y)) || return y
+  d = Dict{String, Any}("type" => string(nameof(typeof(y))))
+  StructUtils.applyeach(FILE_STYLE, y) do k, v
+    d[string(k)] = file_value(v)
+    return nothing
   end
-  return S(vals...)
+  return d
 end
 
-# What `save_parameters` writes: `Dict(x)` without values that are expressions of other
-# parameters (a parent's parameter passed down, `inductor.L = L`; they follow
-# their source and could not be read back) and without the tables that leaves empty.
+# What `save_parameters` writes: `Dict(x)` in file form, without values that are expressions of
+# other parameters (a parent's parameter passed down, `inductor.L = L`; they follow
+# their source and could not be read back), without unset values (`nothing`), and without the
+# tables that leaves empty.
 function saveable(d::AbstractDict)
-  out = Dict{Symbol, Any}()
+  out = Dict{String, Any}()
   for (k, v) in d
     if v isa AbstractDict
       c = saveable(v)
-      isempty(c) || (out[k] = c)
-    elseif !(symbolic_type(Symbolics.unwrap(v)) isa ScalarSymbolic)
-      out[k] = v
+      isempty(c) || (out[string(k)] = c)
+    elseif v !== nothing && !(symbolic_type(Symbolics.unwrap(v)) isa ScalarSymbolic)
+      out[string(k)] = file_value(v)
     end
   end
   return out
@@ -887,13 +940,15 @@ end
 """
     save_parameters(x::MTKParams, filepath::String)
 
-Write `x` to `filepath` as a hierarchical TOML file. `missing` values are stored
-as the string `"missing"` so they round-trip through [`load_parameters`](@ref).
+Write `x` to `filepath` as a hierarchical TOML file: top-level parameters as keys, one
+table per subsystem. A struct value is a table naming its type (see
+[`ParameterFileStyle`](@ref)); `missing` is the string `"missing"`. Values a parent passes
+down (expressions of other parameters) and unset values are left out.
 """
 function save_parameters(x::MTKParams, filepath::String)
 
   open(filepath, "w") do io
-    TOML.print(convert_value, io, saveable(Dict(x)))
+    TOML.print(io, saveable(Dict(x)))
   end
 
 end
@@ -906,7 +961,7 @@ Return the TOML representation of `x` as a `String`. Same format as
 """
 function parameters_to_string(x::MTKParams)
   io = IOBuffer()
-  TOML.print(convert_value, io, saveable(Dict(x)))
+  TOML.print(io, saveable(Dict(x)))
   return String(take!(io))
 end
 

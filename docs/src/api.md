@@ -48,6 +48,7 @@ ModelingToolkitParameters.hide_missing!
 ```@docs
 ModelingToolkitParameters.save_parameters
 ModelingToolkitParameters.load_parameters
+ModelingToolkitParameters.ParameterFileStyle
 ModelingToolkitParameters.parameters_to_string
 ModelingToolkitParameters.string_to_parameters
 ```

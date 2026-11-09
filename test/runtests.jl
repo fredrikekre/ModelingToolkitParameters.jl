@@ -17,6 +17,8 @@ include("struct_parameters.jl")
 
 include("values_and_pairs.jl")
 
+include("parameter_files.jl")
+
 @mtkcompile rc_model = RCModel()
 rc_model_params = MTKParams(RCModel)
 rc_model_params.capacitor.m = 1 #set missing value
