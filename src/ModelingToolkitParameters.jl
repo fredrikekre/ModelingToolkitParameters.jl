@@ -8,7 +8,7 @@ using TOML
 using AbstractTrees
 using Logging
 
-export MTKParams, get_parent, get_defs, pdict, cache, update!, transfer, compare, MTKParamsDiff, @mtkparams, save_parameters, load_parameters, show_missing!, hide_missing!
+export MTKParams, get_parent, get_defs, parameter_pairs, pdict, cache, update!, update, transfer, compare, MTKParamsDiff, @mtkparams, save_parameters, load_parameters, show_missing!, hide_missing!
 
 """
     MTKParamsOptions()
@@ -43,7 +43,7 @@ The system must NOT be structurally simplified — construct it with `@named`
 `ModelingToolkit.initial_conditions(sys)`. Any keyword arguments are applied as
 parameter overrides after construction.
 
-Use [`pdict`](@ref) (or `model => pars`) to convert a `MTKParams` into the
+Use [`pdict`](@ref) (or [`parameter_pairs`](@ref)) to convert a `MTKParams` into the
 parameter map expected by `ODEProblem`/`SciMLBase.remake`, and [`cache`](@ref) +
 [`update!`](@ref) for fast in-place updates.
 
@@ -58,7 +58,11 @@ pars.resistor.R = 2.0
 pars = MTKParams(ConstantVoltage; V = 20)
 ```
 """
-struct MTKParams
+# Mutable because it behaves as a handle: `setproperty!` changes it in place, and a
+# child (`pars.resistor`) is a view sharing the parent's `defs`. Being a `mutable
+# struct` is also what makes `ismutable(pars)` true, which StructEditor checks to edit
+# in place rather than rebuild with Accessors.
+mutable struct MTKParams
     parent::System
     defs::Dict
     # Parameters of *this* system that an enclosing parent binds via a namespaced
@@ -94,7 +98,7 @@ function MTKParams(sys::System; kwargs...)
   #NOTE: sys must be not structuraly simplified because we need access to the sub-systems
   @assert !ModelingToolkit.iscomplete(sys) "`MTKParams` cannot accept a structualy simplified system, please use @named only"
   sys_nn = ModelingToolkit.toggle_namespacing(sys, false)
-  m = MTKParams(sys_nn, ModelingToolkit.initial_conditions(sys), Dict{Symbol, Any}(), own_unresolved_names(sys_nn))
+  m = MTKParams(sys_nn, value_dict(ModelingToolkit.initial_conditions(sys)), Dict{Symbol, Any}(), own_unresolved_names(sys_nn))
   
   for (key, value) in kwargs
     setproperty!(m, key, value)
@@ -116,8 +120,19 @@ get_parent(obj::MTKParams) = getfield(obj, :parent)
 
 Return the internal `symbolic_parameter => value` dictionary holding the current
 overrides for `p`. Mutating the returned dict mutates `p`.
+
+Values are stored as given: a number is a `Number`, a struct the struct. Only a
+value that is itself an expression of other parameters (a value a parent passes
+down, `inductor.L => L`) is symbolic. Before v0.7 every value was a symbolic
+constant (the dictionary was ModelingToolkit's `Dict{SymbolicT, SymbolicT}`), so
+`v isa Number` was never true.
 """
 get_defs(obj::MTKParams) = getfield(obj, :defs)
+
+# The values dictionary of a new `MTKParams`: `defs` (ModelingToolkit's initial
+# conditions, all values symbolic) with every value unwrapped, so that values read
+# back as what they are. Symbolic expressions stay symbolic.
+value_dict(defs) = Dict{ModelingToolkit.SymbolicT, Any}(k => Symbolics.value(v) for (k, v) in defs)
 
 """
     get_bound(p::MTKParams) -> Dict{Symbol, Any}
@@ -225,7 +240,7 @@ function Base.setproperty!(x::MTKParams, var::Symbol, val)
         end
       end
 
-      defs[sym] = val
+      defs[sym] = Symbolics.unwrap(val)
     end
 
     if (sym isa System) & (val isa MTKParams)
@@ -240,7 +255,6 @@ function Base.setproperty!(x::MTKParams, var::Symbol, val)
     return nothing
 end
 
-Base.ismutable(x::MTKParams) = true
 
 """
     bound_parameter_names(sys::System) -> Set{Symbol}
@@ -495,6 +509,10 @@ function Base.isequal(x::MTKParams, y::MTKParams)
   return true
 end
 
+# `isequal` compares the values `Dict(x)` holds, so hashing it keeps `hash` consistent with
+# `isequal` (needed for `MTKParams` as a `Dict` key or in a `Set`).
+Base.hash(x::MTKParams, h::UInt) = hash(Dict(x), hash(MTKParams, h))
+
 
 """
     Absent
@@ -654,26 +672,30 @@ PDict = Dict{SymbolicUtils.BasicSymbolicImpl.var"typeof(BasicSymbolicImpl)"{SymR
     pdict(model::System, pars::MTKParams) -> Dict
 
 Build a `Dict{symbolic_parameter, value}` keyed by the symbolic parameters of
-`model`. This is the form accepted by [`update!`](@ref) and the cache-aware
-`SciMLBase.remake(prob, setters, param_dict)` method.
+`model`. This is the form accepted by [`update!`](@ref) and [`update`](@ref).
 
 For the flat `Vector{Pair}` form expected by `ODEProblem` and the standard
-`SciMLBase.remake(prob; p = ...)`, write `model => pars` instead.
+`SciMLBase.remake(prob; p = ...)`, use [`parameter_pairs`](@ref).
 """
-pdict(model::System, pars::MTKParams) = PDict(model => pars)
+pdict(model::System, pars::MTKParams) = PDict(parameter_pairs(model, pars))
 
 """
-    Pair(model::System, pars::MTKParams) -> Vector{Pair}
+    parameter_pairs(model::System, pars::MTKParams) -> Vector{Pair}
 
 Flatten `pars` against `model` into a `Vector{Pair}` of `symbolic_parameter => value`
 entries (recursively walking sub-systems). This is the form accepted by
-`ODEProblem` and `SciMLBase.remake(prob; p = ...)`. Equivalent to writing
-`model => pars`.
+`ODEProblem` and `SciMLBase.remake(prob; p = ...)`, and the form to splat into a
+parent's `initial_conditions` (`[parameter_pairs(source, special)...]`).
 
 Fields of `pars` that don't have a matching property on `model` produce a warning
 and are skipped.
+
+Before v0.7 this was spelled `model => pars`, via a method on `Base.Pair`. That
+method was removed: `=>` is called everywhere, and adding a method to it
+invalidated tens of thousands of compiled methods in every session that loaded
+this package.
 """
-Base.Pair(model::System, pars::MTKParams) = pairs_against(model, pars, model)
+parameter_pairs(model::System, pars::MTKParams) = pairs_against(model, pars, model)
 
 function pairs_against(model::System, pars::MTKParams, root::System)
 
@@ -755,7 +777,15 @@ function Base.Dict(x::MTKParams)
 end
 
 
-function Base.setproperty!(x::MTKParams, dict::Dict)
+"""
+    update!(pars::MTKParams, dict::AbstractDict) -> pars
+
+Set the values in `dict`, nested as [`Dict`](@ref Dict(::MTKParams)) returns them (one
+dictionary per subsystem; keys may be `Symbol`s or strings, as from `TOML.parse`).
+A dictionary value for a struct-typed parameter is a table naming its type, as
+[`save_parameters`](@ref) writes it.
+"""
+function update!(x::MTKParams, dict::AbstractDict)
     for (key,value) in dict
         skey = Symbol(key)
         if value isa Dict && ModelingToolkit.isparameter(getproperty(get_parent(x), skey))
@@ -763,33 +793,15 @@ function Base.setproperty!(x::MTKParams, dict::Dict)
           sym = getproperty(get_parent(x), skey)
           setproperty!(x, skey, decode_struct(Symbolics.symtype(Symbolics.unwrap(sym)), value))
         elseif value isa Dict
-          setproperty!(getproperty(x, skey), value)
+          update!(getproperty(x, skey), value)
         elseif value isa String
           setproperty!(x, skey, eval(Meta.parse(value)))
         else
           setproperty!(x, skey, value)
         end
     end
+    return x
 end
-
-#TODO: doesn't work, why?
-# function Base.setproperty!(sys::System, x::T) where T <: Params
-#   defs = ModelingToolkit.defaults(sys)
-#   setproperty!(defs, x, sys)
-# end
-
-
-function Base.setproperty!(dict::Dict, x::MTKParams, sys::System)
-  for nm in propertynames(x)
-    prop = getproperty(x, nm)
-    if prop isa MTKParams
-      setproperty!(dict, prop, getproperty(sys, nm))
-    else
-      dict[getproperty(sys, nm)] = prop
-    end
-  end
-end
-
 
 function Base.copy(x::MTKParams)
     return MTKParams(get_parent(x), copy(get_defs(x)), copy(get_bound(x)), copy(get_unresolved(x)), copy(get_options(x)))
@@ -907,7 +919,7 @@ at `filepath` (typically written by [`save_parameters`](@ref)).
 function load_parameters(filepath::String, model::Function)
 
   x = MTKParams(model)
-  setproperty!(x, TOML.parsefile(filepath))
+  update!(x, TOML.parsefile(filepath))
 
   return x
 end
@@ -921,7 +933,7 @@ at `filepath` (typically written by [`save_parameters`](@ref)).
 function load_parameters(filepath::String, sys::System)
 
   x = MTKParams(sys)
-  setproperty!(x, TOML.parsefile(filepath))
+  update!(x, TOML.parsefile(filepath))
 
   return x
 end
@@ -935,7 +947,7 @@ parameter object.
 """
 function load_parameters(filepath::String, x::MTKParams)
 
-  setproperty!(x, TOML.parsefile(filepath))
+  update!(x, TOML.parsefile(filepath))
 
   return x
 end
@@ -948,7 +960,7 @@ Apply parameter values parsed from the TOML string `contents` to the existing
 """
 function string_to_parameters(contents::String, x::MTKParams)
 
-  setproperty!(x, TOML.parse(contents))
+  update!(x, TOML.parse(contents))
 
   return x
 end
@@ -960,7 +972,7 @@ end
 Pre-build a vector of `SymbolicIndexingInterface` setter functions, one per
 parameter field reachable from `x` (recursing into sub-systems). Pass the result,
 together with a parameter map from [`pdict`](@ref), to [`update!`](@ref) or
-`SciMLBase.remake` to mutate an `ODEProblem` without rebuilding the setters on
+[`update`](@ref) to update an `ODEProblem` without rebuilding the setters on
 each call.
 
 `parent` is the top-level system used when constructing each `setp` setter; it
@@ -1042,16 +1054,19 @@ end
 
 
 """
-    SciMLBase.remake(prob::ODEProblem,
-                     setters::Vector{ParameterHookWrapper},
-                     param_dict::Dict) -> ODEProblem
+    update(prob::ODEProblem,
+           setters::Vector{ParameterHookWrapper},
+           param_dict::Dict) -> ODEProblem
 
 Non-mutating counterpart to [`update!`](@ref): copies `prob.p` first so the
 original `prob` is left untouched, then applies the matching setters from
 `param_dict`. Use this when you need a new problem but want to keep the original
 intact.
+
+Before v0.7 this was a method of `SciMLBase.remake`. None of its argument types
+belong to this package, so that method could clash with any other package's.
 """
-function SciMLBase.remake(prob::ODEProblem, setters::Vector{SymbolicIndexingInterface.ParameterHookWrapper}, param_dict::PDict)
+function update(prob::ODEProblem, setters::Vector{SymbolicIndexingInterface.ParameterHookWrapper}, param_dict::PDict)
     prob′ = SciMLBase.remake(prob; p = copy(prob.p)) #NOTE: if p is not set to a copy then p maintains the original reference
     update!(prob′, setters, param_dict)
     # return SciMLBase.remake(prob′) # Note: using remake a 2nd time could be implemented to provide initialization for solvable parameters, see example below...

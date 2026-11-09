@@ -38,7 +38,7 @@ lines(sol; idxs)
 sys_cache = cache(sys, pars′)
 
 pars′.pid.kp = 100.0
-prob′′ = remake(prob, sys_cache, pdict(sys, pars′))  
+prob′′ = update(prob, sys_cache, pdict(sys, pars′))  
 
 sol = solve(prob′′; dtmax=0.1)
 

@@ -11,7 +11,7 @@ ModelingToolkitParameters.MTKParams
 
 ```@docs
 ModelingToolkitParameters.pdict
-Base.Pair(::ModelingToolkitBase.System, ::MTKParams)
+ModelingToolkitParameters.parameter_pairs
 ```
 
 ## Caching and Updates
@@ -20,6 +20,7 @@ Base.Pair(::ModelingToolkitBase.System, ::MTKParams)
 ModelingToolkitParameters.cache
 ModelingToolkitParameters.resolve
 ModelingToolkitParameters.update!
+ModelingToolkitParameters.update
 ```
 
 ## Transferring Solved Parameters
@@ -55,7 +56,7 @@ ModelingToolkitParameters.string_to_parameters
 
 ```julia
 Base.Dict(::MTKParams)
-Base.setproperty!(::MTKParams, ::Dict)
+update!(::MTKParams, ::AbstractDict)
 Base.copy(::MTKParams)
 ```
 

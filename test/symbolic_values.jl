@@ -86,7 +86,7 @@ mpars.medium_data = medium_B
 mpars.branch.gain = 7.0
 
 slow = remake(mprob; p = pdict(msys, mpars))          # the path that already worked
-fast = remake(mprob, msetters, pdict(msys, mpars))    # the cache path under test
+fast = update(mprob, msetters, pdict(msys, mpars))    # the cache path under test
 
 # struct-valued parameter propagated parent -> branch -> leaf (two levels of symbolics)
 @test fast.ps[msys.branch.medium_data].name == "B"

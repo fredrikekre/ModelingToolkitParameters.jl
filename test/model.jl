@@ -95,7 +95,7 @@ special = MTKParams(ConstantVoltage; V = 20, E1=10, E2=20)
     end
 
     initial_conditions = [
-        (source => special)...
+        parameter_pairs(source, special)...
     ]
 
     if use_resistor

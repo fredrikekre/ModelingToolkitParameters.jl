@@ -202,9 +202,9 @@ Now when we build the top level model we can set the component initial_condition
     end
 
     initial_conditions = [
-        (seat => seat_pars)...
-        (car_and_suspension => car_pars)...
-        (wheel => wheel_pars)...
+        parameter_pairs(seat, seat_pars)...
+        parameter_pairs(car_and_suspension, car_pars)...
+        parameter_pairs(wheel, wheel_pars)...
     ]
 
     . . .
@@ -313,7 +313,7 @@ No differences.
 
 
 # Speed
-As mentioned previously, using the keyword default patern for model parameter setting is not a good way to build several model variations, as this requires fully compiling/simplifying the model from scratch each time.  A better way was shown with ModelingToolkitParameters.jl using `remake` and proving an updated parameter map.  However, this way is still not the fastest.  The most efficient approach is to use `SymbolicIndexingInterface.jl`.  `ModelingToolkitParameters.jl` provides a `cache` function that implements the `SymbolicIndexingInterface.jl` utility to provide a more efficient use of `remake`.  The example below demonstrates this comparison.
+As mentioned previously, using the keyword default patern for model parameter setting is not a good way to build several model variations, as this requires fully compiling/simplifying the model from scratch each time.  A better way was shown with ModelingToolkitParameters.jl using `remake` and proving an updated parameter map.  However, this way is still not the fastest.  The most efficient approach is to use `SymbolicIndexingInterface.jl`.  `ModelingToolkitParameters.jl` provides a `cache` function that implements the `SymbolicIndexingInterface.jl` utility to provide a faster alternative to `remake`: `update(prob, setters, pdict(...))` returns an updated copy of the problem, and `update!` updates it in place.  The example below demonstrates this comparison.
 
 
 ```@example speed
@@ -336,8 +336,8 @@ time_slow = @belapsed prob2 = remake($prob; p = pdict($model, $model_pars))  # r
 model_setters = cache(model, model_pars);# build cache (one time only)
 
 model_pars.seat.body.m = 300                                                            # change parameters
-prob3 = remake(prob, model_setters, pdict(model, model_pars))                            # fast remake ODEProblem
-time_fast = @belapsed prob3 = remake($prob, $model_setters, pdict($model, $model_pars))  # fast remake ODEProblem (timed)
+prob3 = update(prob, model_setters, pdict(model, model_pars))                            # fast remake ODEProblem
+time_fast = @belapsed prob3 = update($prob, $model_setters, pdict($model, $model_pars))  # fast remake ODEProblem (timed)
 
 @show time_slow time_fast # hide
 nothing # hide
@@ -377,7 +377,7 @@ From text, this works like the following
 
 ```@example speed
 @mtkparams p = ActiveSuspensionModel.Road()
-setproperty!(p, TOML.parse("""
+update!(p, TOML.parse("""
                           bump = 0.3
                           freq = 0.75
                           offset = 3
@@ -397,7 +397,7 @@ In some cases we might have a model that uses structural parameters, ones that c
     end
 
     initial_conditions = [
-        (source => special)...
+        parameter_pairs(source, special)...
     ]
 
     if use_resistor

@@ -58,7 +58,7 @@ end
         inner_stuff = only(filter(p -> ModelingToolkit.getname(p) == :inner₊stuff, parameters(sys)))
         pars = MTKParams(Outer)
         pars.stuff = Plain(5.0)                         # same concrete type as the default
-        fast = remake(prob, cache(sys, pars), pdict(sys, pars))
+        fast = update(prob, cache(sys, pars), pdict(sys, pars))
         slow = remake(prob; p = pdict(sys, pars))
         @test fast.ps[inner_stuff] === Plain(5.0)
         @test slow.ps[inner_stuff] === Plain(5.0)
